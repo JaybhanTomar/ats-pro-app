@@ -1,6 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { auth } from './firebase';
-import { signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from 'firebase/auth';
+import { supabase } from './supabase';
 
 // --- Utility Functions ---
 
@@ -188,30 +187,33 @@ const App = () => {
 
     // Auth state listener
     useEffect(() => {
-        const unsubscribe = onAuthStateChanged(auth, (user) => {
-            setUser(user);
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+            setUser(session?.user || null);
             setAuthLoading(false);
         });
-        return unsubscribe;
+        return () => subscription.unsubscribe();
     }, []);
 
     // Auth functions
     const signInWithGoogle = async () => {
-        const provider = new GoogleAuthProvider();
-        try {
-            await signInWithPopup(auth, provider);
-        } catch (error) {
+        const { error } = await supabase.auth.signInWithOAuth({
+            provider: 'google',
+            options: {
+                redirectTo: window.location.origin
+            }
+        });
+        if (error) {
             console.error('Error signing in:', error);
         }
     };
 
     const handleSignOut = async () => {
-        try {
-            await signOut(auth);
+        const { error } = await supabase.auth.signOut();
+        if (error) {
+            console.error('Error signing out:', error);
+        } else {
             setSubscription(null);
             setUsage(null);
-        } catch (error) {
-            console.error('Error signing out:', error);
         }
     };
 

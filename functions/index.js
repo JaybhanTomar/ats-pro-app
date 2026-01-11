@@ -1,13 +1,88 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
+const stripe = require('stripe')(functions.config().stripe.secret_key);
 
 admin.initializeApp();
 
-// Whitelist of allowed user emails
+// Subscription plans
+const PLANS = {
+  FREE: {
+    name: 'Free',
+    limits: {
+      analyses: 5,
+      coverLetters: 3,
+      optimizations: 2
+    }
+  },
+  PREMIUM: {
+    name: 'Premium',
+    limits: {
+      analyses: -1, // unlimited
+      coverLetters: -1,
+      optimizations: -1
+    }
+  }
+};
+    price: 9.99
+  }
+};
+
+// Whitelist of allowed users (for beta access)
 const allowedUsers = ['your@email.com']; // Replace with actual emails
 
 // Gemini API key from environment
 const GEMINI_API_KEY = functions.config().gemini.api_key || process.env.GEMINI_API_KEY;
+
+// Helper function to get user subscription
+async function getUserSubscription(uid) {
+  const userDoc = await admin.firestore().collection('users').doc(uid).get();
+  if (!userDoc.exists) {
+    return { plan: 'FREE', stripeCustomerId: null, subscriptionStatus: null };
+  }
+  return userDoc.data();
+}
+
+// Helper function to check usage limits
+async function checkUsageLimit(uid, action) {
+  const user = await getUserSubscription(uid);
+  const plan = PLANS[user.plan] || PLANS.FREE;
+  
+  // Premium users have unlimited usage
+  if (plan[`${action}PerMonth`] === -1) {
+    return { allowed: true, remaining: 'unlimited' };
+  }
+  
+  // Get current month usage
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  
+  const usageQuery = await admin.firestore()
+    .collection('usage')
+    .where('userId', '==', uid)
+    .where('action', '==', action)
+    .where('timestamp', '>=', startOfMonth)
+    .get();
+  
+  const used = usageQuery.size;
+  const limit = plan[`${action}PerMonth`];
+  const remaining = Math.max(0, limit - used);
+  
+  return { 
+    allowed: used < limit, 
+    remaining, 
+    used, 
+    limit 
+  };
+}
+
+// Helper function to record usage
+async function recordUsage(uid, action) {
+  await admin.firestore().collection('usage').add({
+    userId: uid,
+    action,
+    timestamp: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
 
 exports.analyzeResume = functions.https.onCall(async (data, context) => {
   // Check if user is authenticated
@@ -15,10 +90,21 @@ exports.analyzeResume = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated.');
   }
 
-  // Check if user email is in whitelist
+  const uid = context.auth.uid;
+
+  // Check if user email is in whitelist (beta access)
   const userEmail = context.auth.token.email;
   if (!allowedUsers.includes(userEmail)) {
-    throw new functions.https.HttpsError('permission-denied', 'Access denied. User not authorized.');
+    throw new functions.https.HttpsError('permission-denied', 'Access denied. This service is in beta. Contact support for access.');
+  }
+
+  // Check usage limits
+  const usageCheck = await checkUsageLimit(uid, 'analyses');
+  if (!usageCheck.allowed) {
+    throw new functions.https.HttpsError('resource-exhausted', 
+      `Monthly analysis limit reached. ${usageCheck.used}/${usageCheck.limit} used. Upgrade to Premium for unlimited access.`,
+      { upgradeRequired: true, used: usageCheck.used, limit: usageCheck.limit }
+    );
   }
 
   const { resumeText, jobDescription, mode, fileData, mimeType } = data;
@@ -101,7 +187,12 @@ exports.analyzeResume = functions.https.onCall(async (data, context) => {
       cleanJson = rawText.substring(firstBrace, lastBrace + 1);
     }
 
-    return JSON.parse(cleanJson);
+    const result = JSON.parse(cleanJson);
+    
+    // Record usage
+    await recordUsage(uid, 'analyses');
+    
+    return result;
   } catch (error) {
     throw new functions.https.HttpsError('internal', error.message);
   }
@@ -109,13 +200,26 @@ exports.analyzeResume = functions.https.onCall(async (data, context) => {
 
 // Similar functions for coverLetter and optimizeResume
 exports.generateCoverLetter = functions.https.onCall(async (data, context) => {
-  // Similar auth and whitelist checks
+  // Check if user is authenticated
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated.');
   }
+
+  const uid = context.auth.uid;
+
+  // Check if user email is in whitelist (beta access)
   const userEmail = context.auth.token.email;
   if (!allowedUsers.includes(userEmail)) {
-    throw new functions.https.HttpsError('permission-denied', 'Access denied.');
+    throw new functions.https.HttpsError('permission-denied', 'Access denied. This service is in beta. Contact support for access.');
+  }
+
+  // Check usage limits
+  const usageCheck = await checkUsageLimit(uid, 'coverLetters');
+  if (!usageCheck.allowed) {
+    throw new functions.https.HttpsError('resource-exhausted', 
+      `Monthly cover letter limit reached. ${usageCheck.used}/${usageCheck.limit} used. Upgrade to Premium for unlimited access.`,
+      { upgradeRequired: true, used: usageCheck.used, limit: usageCheck.limit }
+    );
   }
 
   const { resumeText, jobDescription, fileData, mimeType } = data;
@@ -168,6 +272,9 @@ exports.generateCoverLetter = functions.https.onCall(async (data, context) => {
     const letter = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!letter) throw new Error("Could not generate text.");
 
+    // Record usage
+    await recordUsage(uid, 'coverLetters');
+
     return letter;
   } catch (error) {
     throw new functions.https.HttpsError('internal', error.message);
@@ -175,13 +282,26 @@ exports.generateCoverLetter = functions.https.onCall(async (data, context) => {
 });
 
 exports.optimizeResume = functions.https.onCall(async (data, context) => {
-  // Similar auth checks
+  // Check if user is authenticated
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated.');
   }
+
+  const uid = context.auth.uid;
+
+  // Check if user email is in whitelist (beta access)
   const userEmail = context.auth.token.email;
   if (!allowedUsers.includes(userEmail)) {
-    throw new functions.https.HttpsError('permission-denied', 'Access denied.');
+    throw new functions.https.HttpsError('permission-denied', 'Access denied. This service is in beta. Contact support for access.');
+  }
+
+  // Check usage limits
+  const usageCheck = await checkUsageLimit(uid, 'optimizations');
+  if (!usageCheck.allowed) {
+    throw new functions.https.HttpsError('resource-exhausted', 
+      `Monthly optimization limit reached. ${usageCheck.used}/${usageCheck.limit} used. Upgrade to Premium for unlimited access.`,
+      { upgradeRequired: true, used: usageCheck.used, limit: usageCheck.limit }
+    );
   }
 
   const { resumeText, jobDescription, fileData, mimeType } = data;
@@ -239,10 +359,66 @@ exports.optimizeResume = functions.https.onCall(async (data, context) => {
     let optimizedText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (optimizedText) {
       optimizedText = optimizedText.replace(/```latex|```/g, '').trim();
+      
+      // Record usage
+      await recordUsage(uid, 'optimizations');
+      
       return optimizedText;
     } else {
       throw new Error("Could not generate text.");
     }
+  } catch (error) {
+    throw new functions.https.HttpsError('internal', error.message);
+  }
+});
+
+// Get subscription and usage data
+exports.getSubscription = functions.https.onCall(async (data, context) => {
+  // Check if user is authenticated
+  if (!context.auth) {
+    throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated.');
+  }
+
+  const uid = context.auth.uid;
+
+  try {
+    // Get user's subscription from Firestore
+    const userDoc = await admin.firestore().collection('users').doc(uid).get();
+    const userData = userDoc.data() || {};
+    
+    // Default to free plan if no subscription
+    const subscription = userData.subscription || 'FREE';
+    
+    // Get current month's usage
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    
+    const usageQuery = await admin.firestore()
+      .collection('usage')
+      .where('userId', '==', uid)
+      .where('timestamp', '>=', startOfMonth)
+      .where('timestamp', '<=', endOfMonth)
+      .get();
+    
+    const usage = {
+      analyses: 0,
+      coverLetters: 0,
+      optimizations: 0
+    };
+    
+    usageQuery.forEach(doc => {
+      const data = doc.data();
+      if (usage.hasOwnProperty(data.type)) {
+        usage[data.type]++;
+      }
+    });
+    
+    return {
+      subscription,
+      usage,
+      limits: PLANS[subscription].limits
+    };
   } catch (error) {
     throw new functions.https.HttpsError('internal', error.message);
   }
