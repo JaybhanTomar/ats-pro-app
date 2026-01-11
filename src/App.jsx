@@ -1,7 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { auth } from './firebase';
 import { signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from 'firebase/auth';
-import { httpsCallable, getFunctions } from 'firebase/functions';
 
 // --- Utility Functions ---
 
@@ -100,6 +99,25 @@ const downloadText = (text, filename) => {
 
 // --- Constants ---
 
+const PLANS = {
+  FREE: {
+    name: 'Free',
+    limits: {
+      analyses: 5,
+      coverLetters: 3,
+      optimizations: 2
+    }
+  },
+  PREMIUM: {
+    name: 'Premium',
+    limits: {
+      analyses: -1, // unlimited
+      coverLetters: -1,
+      optimizations: -1
+    }
+  }
+};
+
 const RESPONSE_SCHEMA = {
     type: "OBJECT",
     properties: {
@@ -141,6 +159,10 @@ const App = () => {
     const [optimizedResume, setOptimizedResume] = useState(null);
     const [optLoading, setOptLoading] = useState(false);
     const [optError, setOptError] = useState(null);
+
+    // Subscription State
+    const [subscription, setSubscription] = useState(null);
+    const [usage, setUsage] = useState(null);
 
     // UI Helpers
     const [copyMessage, setCopyMessage] = useState('');
@@ -186,10 +208,36 @@ const App = () => {
     const handleSignOut = async () => {
         try {
             await signOut(auth);
+            setSubscription(null);
+            setUsage(null);
         } catch (error) {
             console.error('Error signing out:', error);
         }
     };
+
+    // Fetch subscription and usage data
+    const fetchSubscriptionData = useCallback(async () => {
+        if (!user) return;
+
+        try {
+            const response = await fetch('/api/getSubscription');
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const result = await response.json();
+            setSubscription(result.subscription);
+            setUsage(result.usage);
+        } catch (error) {
+            console.error('Error fetching subscription:', error);
+        }
+    }, [user]);
+
+    // Fetch subscription data when user changes
+    useEffect(() => {
+        if (user) {
+            fetchSubscriptionData();
+        }
+    }, [user, fetchSubscriptionData]);
 
     // Scroll effects
     useEffect(() => {
@@ -297,15 +345,24 @@ const App = () => {
         const mode = isJdValid ? "MATCH" : "CRITIQUE";
 
         try {
-            const analyzeResume = httpsCallable(getFunctions(), 'analyzeResume');
-            const result = await analyzeResume({
-                resumeText: resumeFile ? null : resumeText,
-                jobDescription,
-                mode,
-                fileData: resumeFile ? resumeFile.data : null,
-                mimeType: resumeFile ? resumeFile.mimeType : null
+            const response = await fetch('/api/analyzeResume', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    resumeText: resumeFile ? null : resumeText,
+                    jobDescription,
+                    mode,
+                    fileData: resumeFile ? resumeFile.data : null,
+                    mimeType: resumeFile ? resumeFile.mimeType : null
+                })
             });
-            setResults(result.data);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            setResults(result);
         } catch (err) {
             setError(err.message || "Analysis failed.");
         } finally {
@@ -330,14 +387,23 @@ const App = () => {
         setClLoading(true);
 
         try {
-            const generateCoverLetter = httpsCallable(getFunctions(), 'generateCoverLetter');
-            const result = await generateCoverLetter({
-                resumeText: resumeFile ? null : resumeText,
-                jobDescription,
-                fileData: resumeFile ? resumeFile.data : null,
-                mimeType: resumeFile ? resumeFile.mimeType : null
+            const response = await fetch('/api/generateCoverLetter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    resumeText: resumeFile ? null : resumeText,
+                    jobDescription,
+                    fileData: resumeFile ? resumeFile.data : null,
+                    mimeType: resumeFile ? resumeFile.mimeType : null
+                })
             });
-            setCoverLetter(result.data);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            setCoverLetter(result);
         } catch (err) {
             setClError(err.message || "Generation failed.");
         } finally {
@@ -361,14 +427,23 @@ const App = () => {
         setOptLoading(true);
 
         try {
-            const optimizeResume = httpsCallable(getFunctions(), 'optimizeResume');
-            const result = await optimizeResume({
-                resumeText: resumeFile ? null : resumeText,
-                jobDescription,
-                fileData: resumeFile ? resumeFile.data : null,
-                mimeType: resumeFile ? resumeFile.mimeType : null
+            const response = await fetch('/api/optimizeResume', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    resumeText: resumeFile ? null : resumeText,
+                    jobDescription,
+                    fileData: resumeFile ? resumeFile.data : null,
+                    mimeType: resumeFile ? resumeFile.mimeType : null
+                })
             });
-            setOptimizedResume(result.data);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.text();
+            setOptimizedResume(result);
         } catch (err) {
             setOptError(err.message || "Optimization failed.");
         } finally {
@@ -414,7 +489,25 @@ const App = () => {
                     <div className="flex items-center gap-4">
                         {user ? (
                             <div className="flex items-center gap-4">
-                                <span className="text-sm text-slate-600">Welcome, {user.displayName || user.email}</span>
+                                <div className="flex items-center gap-3">
+                                    <span className="text-sm text-slate-600">Welcome, {user.displayName || user.email}</span>
+                                    {subscription && (
+                                        <div className="flex items-center gap-2">
+                                            <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                                                subscription === 'PREMIUM' 
+                                                    ? 'bg-purple-100 text-purple-700 border border-purple-200' 
+                                                    : 'bg-blue-100 text-blue-700 border border-blue-200'
+                                            }`}>
+                                                {subscription === 'PREMIUM' ? 'Premium' : 'Free'}
+                                            </span>
+                                            {usage && subscription === 'FREE' && (
+                                                <div className="text-xs text-slate-500">
+                                                    {usage.analyses || 0}/{PLANS.FREE.limits.analyses} analyses
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
                                 <button 
                                     onClick={handleSignOut}
                                     className="text-slate-500 hover:text-indigo-600 transition-colors flex items-center gap-1 text-sm font-medium"

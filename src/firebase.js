@@ -1,7 +1,6 @@
 // src/firebase.js
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFunctions } from 'firebase/functions';
 
 const firebaseConfig = {
   apiKey: "your-api-key",
