@@ -8,7 +8,8 @@ A powerful, free web app to analyze your resume against job descriptions using A
 - **Cover Letter Generation**: AI-powered cover letters tailored to specific jobs
 - **Resume Optimization**: Rewrite resumes in LaTeX format for better ATS compatibility
 - **File Support**: Upload PDF, DOCX, or TXT files
-- **Free to Use**: Powered by your own Google Gemini API key (stored locally)
+- **Secure Authentication**: Google sign-in required, API keys protected server-side
+- **Access Control**: Only approved users can use the service
 
 ## Getting Started
 
@@ -45,49 +46,42 @@ npm run build
 
 The built files will be in the `dist` folder.
 
-## Publishing for Free
+## Deployment
 
-### Option 1: Vercel (Recommended)
+### Frontend (Vercel)
 
-1. Go to [vercel.com](https://vercel.com) and sign up for a free account.
-2. Connect your GitHub account.
-3. Click "New Project" and import this repository.
-4. Vercel will automatically detect it as a Vite React app and deploy it.
-5. Your app will be live at a URL like `https://ats-pro.vercel.app`.
+1. Push code to GitHub
+2. Go to [vercel.com](https://vercel.com) and import the repo
+3. Deploy automatically
 
-### Option 2: Netlify
+### Backend (Firebase Functions)
 
-1. Go to [netlify.com](https://netlify.com) and sign up.
-2. Click "Sites" > "Deploy manually".
-3. Drag and drop the `dist` folder (after running `npm run build`) into the deploy area.
-4. Your site will be live instantly.
-
-### Option 3: GitHub Pages
-
-1. Install gh-pages: `npm install --save-dev gh-pages`
-2. Add to package.json scripts: `"deploy": "gh-pages -d dist"`
-3. Run `npm run build && npm run deploy`
-4. Enable GitHub Pages in your repo settings.
+1. Set up Firebase project and enable Functions
+2. Deploy functions: `firebase deploy --only functions`
+3. Update `src/firebase.js` with your Firebase config
+4. Deploy hosting: `firebase deploy --only hosting`
 
 ## Usage
 
-1. Paste a job description (optional, but recommended for targeted analysis).
-2. Upload your resume (PDF, DOCX, or TXT) or paste the text.
-3. Click "Run ATS Scan" to analyze.
-4. Optionally generate a cover letter or optimize your resume.
+1. Sign in with Google
+2. Paste a job description (optional, but recommended for targeted analysis).
+3. Upload your resume (PDF, DOCX, or TXT) or paste the text.
+4. Click "Run ATS Scan" to analyze.
+5. Optionally generate a cover letter or optimize your resume.
 
-## API Key Setup
+## Security
 
-To use the AI features:
-1. Get a free Google Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey).
-2. In the app, click the Settings gear icon.
-3. Paste your API key (it's stored locally in your browser).
+- **No API keys in frontend**: Gemini API calls are made server-side
+- **Authentication required**: All features require Google sign-in
+- **Access control**: Only whitelisted email addresses can use the service
+- **Server-side processing**: Sensitive operations happen in Firebase Functions
 
 ## Technologies Used
 
 - React 19
 - Vite
 - Tailwind CSS
+- Firebase (Auth, Functions)
 - Google Gemini AI
 - Mammoth.js (for DOCX parsing)
 

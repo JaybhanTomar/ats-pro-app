@@ -1,4 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { auth } from './firebase';
+import { signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from 'firebase/auth';
+import { httpsCallable, getFunctions } from 'firebase/functions';
 
 // --- Utility Functions ---
 
@@ -113,6 +116,10 @@ const RESPONSE_SCHEMA = {
 // --- Main Application Component ---
 
 const App = () => {
+    // Auth State
+    const [user, setUser] = useState(null);
+    const [authLoading, setAuthLoading] = useState(true);
+
     // State Management
     const [jobDescription, setJobDescription] = useState('');
     
@@ -137,11 +144,6 @@ const App = () => {
 
     // UI Helpers
     const [copyMessage, setCopyMessage] = useState('');
-    const [showSettings, setShowSettings] = useState(false);
-    
-    // API Key State Separation
-    const [savedApiKey, setSavedApiKey] = useState(''); // The key actually used for requests
-    const [tempApiKey, setTempApiKey] = useState('');   // The key currently being typed in input
 
     // Refs for auto-scrolling
     const resultsRef = useRef(null);
@@ -160,38 +162,33 @@ const App = () => {
             script.async = true;
             document.body.appendChild(script);
         }
-        
-        // Load API Key from LocalStorage safely
-        if (typeof window !== 'undefined' && window.localStorage) {
-            const storedKey = localStorage.getItem('gemini_api_key');
-            if (storedKey) {
-                setSavedApiKey(storedKey);
-                setTempApiKey(storedKey); // Initialize input with saved key
-            }
-        }
     }, []);
 
-    const handleSaveApiKey = () => {
-        setSavedApiKey(tempApiKey);
-        if (typeof window !== 'undefined' && window.localStorage) {
-            localStorage.setItem('gemini_api_key', tempApiKey);
+    // Auth state listener
+    useEffect(() => {
+        const unsubscribe = onAuthStateChanged(auth, (user) => {
+            setUser(user);
+            setAuthLoading(false);
+        });
+        return unsubscribe;
+    }, []);
+
+    // Auth functions
+    const signInWithGoogle = async () => {
+        const provider = new GoogleAuthProvider();
+        try {
+            await signInWithPopup(auth, provider);
+        } catch (error) {
+            console.error('Error signing in:', error);
         }
-        setShowSettings(false);
     };
 
-    const handleClearApiKey = () => {
-        setSavedApiKey('');
-        setTempApiKey('');
-        if (typeof window !== 'undefined' && window.localStorage) {
-            localStorage.removeItem('gemini_api_key');
+    const handleSignOut = async () => {
+        try {
+            await signOut(auth);
+        } catch (error) {
+            console.error('Error signing out:', error);
         }
-        setShowSettings(false);
-    };
-
-    const handleCloseSettings = () => {
-        // Reset temp input to match saved key on close (discard unsaved changes)
-        setTempApiKey(savedApiKey);
-        setShowSettings(false);
     };
 
     // Scroll effects
@@ -289,95 +286,39 @@ const App = () => {
     // --- Action 1: Run ATS Analysis ---
     const handleAnalyze = useCallback(async (e) => {
         e.preventDefault();
+        if (!user) {
+            setError("Please sign in to use this feature.");
+            return;
+        }
         setError(null);
         setResults(null);
         setLoading(true);
 
         const mode = isJdValid ? "MATCH" : "CRITIQUE";
-        
-        // Strict System Prompt
-        const systemPrompt = mode === "MATCH" 
-            ? "You are a strict, deterministic Applicant Tracking System (ATS) algorithm. Your task is to evaluate the resume against the job description with zero creativity. Be extremely critical and objective. If keywords from the JD are missing, penalize the score. If formatting is poor, penalize the score. Your output must be consistent. Return JSON matching the schema."
-            : "You are a strict Resume Coach. Critique this resume against general industry standards. Be critical. Return JSON matching the schema.";
-
-        // Construct Content Parts
-        let promptText = "";
-
-        if (mode === "MATCH") {
-            promptText += `ANALYZE MATCH:\n\nJOB DESCRIPTION:\n${jobDescription}\n\n`;
-        } else {
-            promptText += `ANALYZE RESUME CRITIQUE:\n\n`;
-        }
-
-        const contentParts = [];
-
-        // Attach Resume Content
-        if (resumeFile) {
-            promptText += "RESUME FILE (See attached PDF):";
-            contentParts.push({ text: promptText });
-            contentParts.push({ 
-                inlineData: {
-                    mimeType: resumeFile.mimeType,
-                    data: resumeFile.data
-                } 
-            });
-        } else {
-            promptText += `RESUME TEXT:\n${resumeText}`;
-            contentParts.push({ text: promptText });
-        }
-
-        // Use savedApiKey. If it exists, it overrides the empty string (system default).
-        const apiKey = savedApiKey || ""; 
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-
-        // Disable Search for Strict Match Mode to ensure consistency
-        // Also disable if resumeFile is present (multimodal conflict)
-        const useSearch = !resumeFile && mode === "CRITIQUE";
-
-        const payload = {
-            contents: [{ parts: contentParts }],
-            tools: useSearch ? [{ "google_search": {} }] : undefined,
-            systemInstruction: { parts: [{ text: systemPrompt }] },
-            generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: RESPONSE_SCHEMA,
-                temperature: 0.0, // Zero temperature for deterministic output
-            }
-        };
 
         try {
-            const response = await fetchWithBackoff(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
+            const analyzeResume = httpsCallable(getFunctions(), 'analyzeResume');
+            const result = await analyzeResume({
+                resumeText: resumeFile ? null : resumeText,
+                jobDescription,
+                mode,
+                fileData: resumeFile ? resumeFile.data : null,
+                mimeType: resumeFile ? resumeFile.mimeType : null
             });
-
-            const data = await response.json();
-            
-            if (data.error) throw new Error(data.error.message);
-            
-            const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!rawText) throw new Error("No analysis returned.");
-
-            // Robust JSON extraction
-            let cleanJson = rawText;
-            const firstBrace = rawText.indexOf('{');
-            const lastBrace = rawText.lastIndexOf('}');
-            if (firstBrace !== -1 && lastBrace !== -1) {
-                cleanJson = rawText.substring(firstBrace, lastBrace + 1);
-            }
-            
-            setResults(JSON.parse(cleanJson));
-
+            setResults(result.data);
         } catch (err) {
-            setError(err.message || "Analysis failed. If this persists, check your API Key settings.");
+            setError(err.message || "Analysis failed.");
         } finally {
             setLoading(false);
         }
-    }, [isJdValid, jobDescription, resumeText, resumeFile, savedApiKey]);
+    }, [isJdValid, jobDescription, resumeText, resumeFile, user]);
 
     // --- Action 2: Generate Cover Letter ---
     const handleCoverLetter = useCallback(async () => {
+        if (!user) {
+            setClError("Please sign in to use this feature.");
+            return;
+        }
         // Validation check inside handler
         if (!isJdValid) {
             setClError("Please paste a Job Description first. A targeted cover letter requires a specific job to match against.");
@@ -388,59 +329,28 @@ const App = () => {
         setCoverLetter(null);
         setClLoading(true);
 
-        const systemPrompt = "You are a professional career writer. Write a concise, compelling cover letter (300 words max) connecting the candidate's specific resume achievements to the job description's requirements. Use a formal but modern tone.";
-
-        let promptText = `GENERATE COVER LETTER:\n\nJOB DESCRIPTION:\n${jobDescription}\n\n`;
-        const contentParts = [];
-
-        if (resumeFile) {
-            promptText += "RESUME FILE (See attached PDF):";
-            contentParts.push({ text: promptText });
-            contentParts.push({ 
-                inlineData: {
-                    mimeType: resumeFile.mimeType,
-                    data: resumeFile.data
-                } 
-            });
-        } else {
-            promptText += `RESUME TEXT:\n${resumeText}`;
-            contentParts.push({ text: promptText });
-        }
-
-        const apiKey = savedApiKey || "";
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-
         try {
-            const response = await fetchWithBackoff(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: contentParts }],
-                    // Disable search grounding if uploading a file (multimodal) to avoid 400 Bad Request conflicts
-                    tools: !resumeFile ? [{ "google_search": {} }] : undefined,
-                    systemInstruction: { parts: [{ text: systemPrompt }] },
-                    generationConfig: {
-                         temperature: 0.7 // Keep some creativity for the letter writing
-                    }
-                }),
+            const generateCoverLetter = httpsCallable(getFunctions(), 'generateCoverLetter');
+            const result = await generateCoverLetter({
+                resumeText: resumeFile ? null : resumeText,
+                jobDescription,
+                fileData: resumeFile ? resumeFile.data : null,
+                mimeType: resumeFile ? resumeFile.mimeType : null
             });
-
-            const data = await response.json();
-            if (data.error) throw new Error(data.error.message);
-            
-            const letter = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (letter) setCoverLetter(letter);
-            else throw new Error("Could not generate text.");
-
+            setCoverLetter(result.data);
         } catch (err) {
-            setClError(err.message || "Generation failed. Check your API Key settings.");
+            setClError(err.message || "Generation failed.");
         } finally {
             setClLoading(false);
         }
-    }, [jobDescription, resumeText, resumeFile, savedApiKey, isJdValid]);
+    }, [jobDescription, resumeText, resumeFile, user, isJdValid]);
 
     // --- Action 3: Optimize Resume (New Feature - LaTeX) ---
     const handleOptimizeResume = useCallback(async () => {
+        if (!user) {
+            setOptError("Please sign in to use this feature.");
+            return;
+        }
         if (!isJdValid) {
             setOptError("Please paste a Job Description first. We need to know which keywords to optimize for.");
             return;
@@ -450,65 +360,21 @@ const App = () => {
         setOptimizedResume(null);
         setOptLoading(true);
 
-        const systemPrompt = "You are an expert Executive Resume Writer and LaTeX developer. Your task is to rewrite the candidate's resume content to maximize their ATS score for the provided Job Description and output it as a complete, compilable LaTeX document. \n" +
-        "1. PRESERVE STRUCTURE: Keep the original resume's sections (Header, Summary, Experience, Education, Skills). \n" +
-        "2. INTEGRATE KEYWORDS: Naturally weave in critical hard skills and keywords from the JD into the Summary and Experience sections. \n" +
-        "3. ENHANCE IMPACT: Rewrite bullet points to use strong action verbs and emphasize results/impact. \n" +
-        "4. COMPACT ATS LAYOUT: Use `\\documentclass[10pt,letterpaper]{article}`. Include `\\usepackage[left=0.6in,top=0.6in,right=0.6in,bottom=0.6in]{geometry}` to maximize space. Use `\\usepackage{enumitem}` and `\\setlist{nosep}` to remove gaps between bullets. Use `\\titlespacing` to reduce header space. NO TABLES. \n" +
-        "5. OUTPUT: Provide ONLY the raw LaTeX code starting with \\documentclass and ending with \\end{document}. Do not wrap it in markdown code blocks.";
-
-        let promptText = `GENERATE COMPACT LATEX RESUME OPTIMIZED FOR JD:\n\nJOB DESCRIPTION:\n${jobDescription}\n\n`;
-        const contentParts = [];
-
-        if (resumeFile) {
-            promptText += "RESUME FILE (See attached PDF):";
-            contentParts.push({ text: promptText });
-            contentParts.push({ 
-                inlineData: {
-                    mimeType: resumeFile.mimeType,
-                    data: resumeFile.data
-                } 
-            });
-        } else {
-            promptText += `RESUME TEXT:\n${resumeText}`;
-            contentParts.push({ text: promptText });
-        }
-
-        const apiKey = savedApiKey || "";
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-
         try {
-            const response = await fetchWithBackoff(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: contentParts }],
-                    tools: !resumeFile ? [{ "google_search": {} }] : undefined,
-                    systemInstruction: { parts: [{ text: systemPrompt }] },
-                    generationConfig: {
-                         temperature: 0.4 
-                    }
-                }),
+            const optimizeResume = httpsCallable(getFunctions(), 'optimizeResume');
+            const result = await optimizeResume({
+                resumeText: resumeFile ? null : resumeText,
+                jobDescription,
+                fileData: resumeFile ? resumeFile.data : null,
+                mimeType: resumeFile ? resumeFile.mimeType : null
             });
-
-            const data = await response.json();
-            if (data.error) throw new Error(data.error.message);
-            
-            let optimizedText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (optimizedText) {
-                // Clean up any markdown code blocks if the model adds them despite instructions
-                optimizedText = optimizedText.replace(/```latex|```/g, '').trim();
-                setOptimizedResume(optimizedText);
-            } else {
-                throw new Error("Could not generate text.");
-            }
-
+            setOptimizedResume(result.data);
         } catch (err) {
             setOptError(err.message || "Optimization failed.");
         } finally {
             setOptLoading(false);
         }
-    }, [jobDescription, resumeText, resumeFile, savedApiKey, isJdValid]);
+    }, [jobDescription, resumeText, resumeFile, user, isJdValid]);
 
 
     // --- Components ---
@@ -536,51 +402,6 @@ const App = () => {
     return (
         <div className="min-h-screen bg-slate-50 font-sans text-slate-800 selection:bg-indigo-100 selection:text-indigo-800 relative">
             
-            {/* Settings Modal */}
-            {showSettings && (
-                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                    <div className="bg-white rounded-xl shadow-2xl p-6 max-w-md w-full animate-fade-in-up">
-                        <div className="flex justify-between items-center mb-4">
-                            <h3 className="text-xl font-bold text-slate-800">API Settings</h3>
-                            <button onClick={handleCloseSettings} className="text-slate-400 hover:text-slate-600">
-                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
-                            </button>
-                        </div>
-                        <p className="text-sm text-slate-600 mb-4">
-                            To use this app for free, you can enter your own <strong>Google Gemini API Key</strong>. 
-                            Your key is stored locally in your browser and never sent to our servers.
-                        </p>
-                        <div className="mb-4">
-                            <label className="block text-sm font-semibold text-slate-700 mb-2">Gemini API Key</label>
-                            <input 
-                                type="password" 
-                                className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                                placeholder="Paste AIza... key here"
-                                value={tempApiKey}
-                                onChange={(e) => setTempApiKey(e.target.value)}
-                            />
-                        </div>
-                        <div className="flex justify-between gap-3">
-                            <button 
-                                onClick={handleClearApiKey}
-                                className="px-4 py-2 text-red-600 text-sm font-medium hover:text-red-800"
-                            >
-                                Clear Key
-                            </button>
-                            <div className="flex gap-2">
-                                <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 text-sm font-medium hover:underline self-center">Get a Free Key →</a>
-                                <button 
-                                    onClick={handleSaveApiKey}
-                                    className="px-4 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition-colors"
-                                >
-                                    Save Key
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
             {/* Header */}
             <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
                 <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
@@ -591,24 +412,65 @@ const App = () => {
                         </span>
                     </div>
                     <div className="flex items-center gap-4">
-                        {savedApiKey && (
-                            <span className="hidden sm:flex text-xs font-semibold text-green-600 bg-green-50 px-2 py-1 rounded border border-green-200 items-center animate-fade-in-up">
-                                <span className="w-2 h-2 bg-green-500 rounded-full mr-1.5 animate-pulse"></span>
-                                Custom Key Active
-                            </span>
+                        {user ? (
+                            <div className="flex items-center gap-4">
+                                <span className="text-sm text-slate-600">Welcome, {user.displayName || user.email}</span>
+                                <button 
+                                    onClick={handleSignOut}
+                                    className="text-slate-500 hover:text-indigo-600 transition-colors flex items-center gap-1 text-sm font-medium"
+                                >
+                                    Sign Out
+                                </button>
+                            </div>
+                        ) : (
+                            <button 
+                                onClick={signInWithGoogle}
+                                className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors flex items-center gap-2 text-sm font-medium"
+                            >
+                                <svg className="w-4 h-4" viewBox="0 0 24 24">
+                                    <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                                    <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                                    <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                                    <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                                </svg>
+                                Sign In
+                            </button>
                         )}
-                        <button 
-                            onClick={() => setShowSettings(true)}
-                            className="text-slate-500 hover:text-indigo-600 transition-colors flex items-center gap-1 text-sm font-medium"
-                        >
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.456 1.724 1.724 0 00-2.572 1.065c-1.543 2.572 1.756 2.924 0 3.35a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.456 1.724 1.724 0 002.572-1.065zM15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-                            Settings
-                        </button>
                     </div>
                 </div>
             </header>
 
-            <main className="max-w-5xl mx-auto px-4 py-8">
+            {authLoading ? (
+                <div className="min-h-screen flex items-center justify-center">
+                    <div className="text-center">
+                        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
+                        <p className="text-slate-600">Loading...</p>
+                    </div>
+                </div>
+            ) : !user ? (
+                <div className="min-h-screen flex items-center justify-center bg-slate-50">
+                    <div className="text-center max-w-md mx-auto p-8">
+                        <div className="w-16 h-16 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-2xl mx-auto mb-6">A</div>
+                        <h1 className="text-3xl font-bold text-slate-900 mb-4">Welcome to ATS Pro</h1>
+                        <p className="text-slate-600 mb-8">
+                            Sign in with Google to analyze your resume, generate cover letters, and optimize for ATS systems.
+                        </p>
+                        <button 
+                            onClick={signInWithGoogle}
+                            className="bg-indigo-600 text-white px-8 py-3 rounded-lg hover:bg-indigo-700 transition-colors flex items-center gap-3 mx-auto text-lg font-medium"
+                        >
+                            <svg className="w-5 h-5" viewBox="0 0 24 24">
+                                <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                                <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                                <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                                <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                            </svg>
+                            Sign In with Google
+                        </button>
+                    </div>
+                </div>
+            ) : (
+                <main className="max-w-5xl mx-auto px-4 py-8">
                 
                 {/* Introduction */}
                 <div className="text-center mb-10">
@@ -988,6 +850,7 @@ const App = () => {
                 )}
 
             </main>
+            )}
         </div>
     );
 };
